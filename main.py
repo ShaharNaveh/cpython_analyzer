@@ -5,15 +5,11 @@ import ast
 import collections
 import dataclasses
 import functools
-import graphlib
 import itertools
 import json
 import pathlib
 import typing
 import warnings
-
-# import sys
-# sys.setrecursionlimit(15000)
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterable
@@ -134,6 +130,80 @@ def build_dep_tree():
     return {name: list(deps) for name, deps in deps_map.items()}
 
 
+def find_sccs(graph: dict[str, set[str]]) -> list[frozenset[str]]:
+    """
+    Kosaraju's algorithm: returns SCCs in reverse topological order.
+    """
+    visited = set()
+    finish_order = []
+
+    def dfs_forward(node: str) -> None:
+        stack = [(node, iter(graph.get(node, ())))]
+        while stack:
+            n, children = stack[-1]
+            try:
+                child = next(children)
+                if child not in visited:
+                    visited.add(child)
+                    stack.append((child, iter(graph.get(child, ()))))
+            except StopIteration:
+                finish_order.append(n)
+                stack.pop()
+
+    for node in graph:
+        if node in visited:
+            continue
+        visited.add(node)
+        dfs_forward(node)
+
+    reverse = collections.defaultdict(set)
+    for node, deps in graph.items():
+        for dep in deps:
+            reverse[dep].add(node)
+
+    visited.clear()
+    sccs = []
+
+    def dfs_reverse(start: str) -> frozenset[str]:
+        component: set[str] = set()
+        stack = [start]
+        while stack:
+            n = stack.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+            component.add(n)
+            stack.extend(reverse.get(n, ()))
+        return frozenset(component)
+
+    for node in reversed(finish_order):
+        if node not in visited:
+            sccs.append(dfs_reverse(node))
+
+    return sccs
+
+
+def collapse_sccs(
+    raw: dict[str, set[str]],
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    sccs = find_sccs(raw)
+    canonical = {}
+    for scc in sccs:
+        canon = min(scc)
+        for name in scc:
+            canonical[name] = canon
+
+    condensed = collections.defaultdict(set)
+    for node, deps in raw.items():
+        c = canonical[node]
+        for dep in deps:
+            cd = canonical[dep]
+            if cd != c:
+                condensed[c].add(cd)
+
+    return dict(condensed), canonical
+
+
 def main():
     try:
         deps_map = json.loads(CACHE_FILE.read_text())
@@ -143,56 +213,43 @@ def main():
 
     raw_deps_map = {name: set(deps) for name, deps in deps_map.items()}
 
-    deps_map = raw_deps_map.copy()
-    cycle_pairs = {}
-    while True:
-        ts = graphlib.TopologicalSorter(deps_map)
-        try:
-            tuple(ts.static_order())
-            break
-        except graphlib.CycleError as err:
-            cycle = err.args[1]
-            modules = list(set(cycle))[:2]
-            a, b = modules
-            cycle_pairs[a] = b
-            cycle_pairs[b] = a
-            # join the deps of both
-            deps_map[a] |= deps_map.pop(b) - {a}
+    # Now we deal with the circular imports :/
+    deps_map, canonical = collapse_sccs(raw_deps_map)
 
-    """
     @functools.cache
     def tree_of(name: str) -> dict[str, dict]:
-        seen = set()
-
-        def inner(s: str):
-            seen.add(s)
-            return {dep: inner(dep) for dep in (deps_map.get(s, frozenset()) - seen)}
-
-        return inner(name)
-    """
+        canon = canonical.get(name, name)
+        return {dep: tree_of(dep) for dep in deps_map.get(canon, ())}
 
     @functools.cache
-    def tree_of(name: str, *, depth: int = 1) -> dict[str, dict]:
-        if depth == 0:
-            return {}
+    def is_depof(x: str, y: str) -> bool:
+        """
+        is `x` a sub-dependency of `y`?
 
-        ndepth = depth - 1
-        out = {
-            dep: tree_of(dep, depth=ndepth) for dep in deps_map.get(name, frozenset())
-        }
+        Examples
+        --------
+        >>> is_depof("ast", "_ast")
+        False
+        >>> is_depof("_ast", "ast")
+        True
+        """
+        cx = canonical.get(x, x)
+        cy = canonical.get(y, y)
+        if cx == cy:
+            return False
+        cy_tree = tree_of(cy)
+        return (cx in cy_tree) or any(is_depof(cx, dep) for dep in cy_tree)
 
-        if pair := cycle_pairs.get(name):
-            return tree_of(pair, depth=ndepth) | out
+    all_libs = frozenset(raw_deps_map)
+    stats = collections.defaultdict(int)
+    for x, y in itertools.permutations(all_libs, 2):
+        stats[x] += int(is_depof(x, y))
 
-        return out
+    print(collections.Counter(stats).most_common(99))
 
-    """
-    ts = graphlib.TopologicalSorter(deps_map)
-    for lib in reversed(tuple(ts.static_order())):
-        tree_of(lib)  # Prime the caches in order to not get inf recursion
-    """
-    x = tree_of("pathlib")
-    print(json.dumps(x, indent=4))
+    dumped = json.dumps(stats, indent=4, sort_keys=True)
+
+    (ROOT / "stats.json").write_text(dumped + "\n")
 
 
 if __name__ == "__main__":
